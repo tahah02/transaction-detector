@@ -1,13 +1,13 @@
 import pandas as pd
 import numpy as np
-from backend.utils import (ensure_data_dir, get_clean_csv_path,
+from backend.utils import (ensure_data_dir, get_db_data,
                           TRANSFER_TYPE_ENCODED, TRANSFER_TYPE_RISK)
 
 OUTPUT_PATH = 'data/feature_datasetv2.csv'
 
 def engineer_features():
     ensure_data_dir()
-    df = pd.read_csv(get_clean_csv_path())
+    df = get_db_data()
     
     df['CreateDate'] = pd.to_datetime(df.get('CreateDate'), errors='coerce')
     df['transaction_amount'] = pd.to_numeric(df.get('AmountInAed', 0), errors='coerce').fillna(0)
@@ -76,26 +76,42 @@ def engineer_features():
         
         for s, col in [(30,'txn_count_30s'),(600,'txn_count_10min'),(3600,'txn_count_1hour')]:
             df[col] = df.groupby(key, group_keys=False).apply(lambda g: rolling_count(g, s))
-        for freq, cols in [('H', ('hourly_total','hourly_count')),
+        for freq, cols in [('h', ('hourly_total','hourly_count')),
                           ('D', ('daily_total','daily_count'))]:
-            k = df['CreateDate'].dt.floor(freq)
-            agg = df.groupby(key + [k])['transaction_amount'].agg(['sum','count'])
-            agg.columns = cols
-            df = df.merge(agg.reset_index(), on=key + [k.name], how='left').drop(columns=k.name)
+            if 'CreateDate' in df.columns:
+                k = df['CreateDate'].dt.floor(freq)
+                agg = df.groupby(key + [k])['transaction_amount'].agg(['sum','count'])
+                agg.columns = cols
+                df = df.merge(agg.reset_index(), on=key + [k.name], how='left').drop(columns=k.name)
+            else:
+                df[cols[0]] = df['transaction_amount']
+                df[cols[1]] = 1
         
-        df['week_key'] = df['CreateDate'].dt.to_period('W')
-        wk = df.groupby(key+['week_key'])['transaction_amount'].agg(['sum','count','mean'])
-        wk.columns = ['weekly_total','weekly_txn_count','weekly_avg_amount']
-        df = df.merge(wk.reset_index(), on=key+['week_key'], how='left').drop(columns='week_key')
-        df['weekly_deviation'] = abs(df['transaction_amount'] - df['weekly_avg_amount'])
-        df['amount_vs_weekly_avg'] = df['transaction_amount'] / df['weekly_avg_amount'].replace(0,1)
-        
-        df['month_key'] = df['CreateDate'].dt.to_period('M')
-        mo = df.groupby(key+['month_key'])['transaction_amount'].agg(['sum','count','mean'])
-        mo.columns = ['current_month_spending','monthly_txn_count','monthly_avg_amount']
-        df = df.merge(mo.reset_index(), on=key+['month_key'], how='left').drop(columns='month_key')
-        df['monthly_deviation'] = abs(df['transaction_amount'] - df['monthly_avg_amount'])
-        df['amount_vs_monthly_avg'] = df['transaction_amount'] / df['monthly_avg_amount'].replace(0,1)
+        if 'CreateDate' in df.columns:
+            df['week_key'] = df['CreateDate'].dt.to_period('W')
+            wk = df.groupby(key+['week_key'])['transaction_amount'].agg(['sum','count','mean'])
+            wk.columns = ['weekly_total','weekly_txn_count','weekly_avg_amount']
+            df = df.merge(wk.reset_index(), on=key+['week_key'], how='left').drop(columns='week_key')
+            df['weekly_deviation'] = abs(df['transaction_amount'] - df['weekly_avg_amount'])
+            df['amount_vs_weekly_avg'] = df['transaction_amount'] / df['weekly_avg_amount'].replace(0,1)
+            
+            df['month_key'] = df['CreateDate'].dt.to_period('M')
+            mo = df.groupby(key+['month_key'])['transaction_amount'].agg(['sum','count','mean'])
+            mo.columns = ['current_month_spending','monthly_txn_count','monthly_avg_amount']
+            df = df.merge(mo.reset_index(), on=key+['month_key'], how='left').drop(columns='month_key')
+            df['monthly_deviation'] = abs(df['transaction_amount'] - df['monthly_avg_amount'])
+            df['amount_vs_monthly_avg'] = df['transaction_amount'] / df['monthly_avg_amount'].replace(0,1)
+        else:
+            df['weekly_total'] = df['transaction_amount']
+            df['weekly_txn_count'] = 1
+            df['weekly_avg_amount'] = df['transaction_amount']
+            df['weekly_deviation'] = 0
+            df['amount_vs_weekly_avg'] = 1
+            df['current_month_spending'] = df['transaction_amount']
+            df['monthly_txn_count'] = 1
+            df['monthly_avg_amount'] = df['transaction_amount']
+            df['monthly_deviation'] = 0
+            df['amount_vs_monthly_avg'] = 1
         
         df['rolling_std'] = df.groupby(key)['transaction_amount'].transform(lambda x: x.rolling(min(5,len(x)),1).std()).fillna(0)
         df['transaction_velocity'] = (1 / (df['time_since_last'].replace(0,1) / 3600)).fillna(0)

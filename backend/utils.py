@@ -1,5 +1,6 @@
 import os
 import joblib
+from backend.db_service import get_db_service
 
 def ensure_data_dir():
     os.makedirs('data', exist_ok=True)
@@ -13,6 +14,15 @@ def get_feature_engineered_path():
 
 def get_model_path():
     return 'backend/model/isolation_forest.pkl'
+
+def get_db_data():
+    db = get_db_service()
+    if not db.connect():
+        raise Exception("Cannot connect to database")
+    
+    columns_str = ", ".join([f"[{col}]" for col in db.REQUIRED_COLUMNS])
+    query = f"SELECT {columns_str} FROM TransactionHistoryLogs ORDER BY CreateDate DESC"
+    return db.execute_query(query)
 
 TRANSFER_TYPE_MAPPING = {'S': 'Overseas', 'I': 'Ajman', 'L': 'UAE', 'Q': 'Quick', 'O': 'Own'}
 TRANSFER_TYPE_ENCODED = {'S': 4, 'I': 1, 'L': 2, 'Q': 3, 'O': 0}

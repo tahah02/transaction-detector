@@ -8,6 +8,7 @@ from backend.utils import get_feature_engineered_path, get_model_path, load_mode
 from backend.hybrid_decision import make_decision
 from backend.rule_engine import calculate_all_limits
 from backend.autoencoder import AutoencoderInference
+from backend.db_service import get_db_service
 
 def save_transaction_to_csv(cid, amount, t_type, status="Approved"):
     file_name = 'transaction_history.csv'
@@ -19,7 +20,7 @@ def save_transaction_to_csv(cid, amount, t_type, status="Approved"):
             writer.writerow(['CustomerID', 'Amount', 'Type', 'Status', 'Timestamp'])
         writer.writerow([cid, amount, t_type, status, datetime.now()])
 
-st.set_page_config(page_title="Banking Fraud Detection", layout="wide")
+st.set_page_config(page_title="Banking Fraud Detection", layout="wide", initial_sidebar_state="expanded")
 
 def init_state():
     if 'logged_in' not in st.session_state:
@@ -73,12 +74,21 @@ def add_monthly_spending(cid, account_no, amount):
 
 @st.cache_data
 def load_data():
-    path = get_feature_engineered_path()
-    if os.path.exists(path):
-        return pd.read_csv(path)
-    else:
-        st.error(f"Data file not found: {path}")
-        st.info("Run `python -m backend.feature_engineering` first.")
+    try:
+        db = get_db_service()
+        if not db.connect():
+            st.error("Cannot connect to database")
+            return None
+        
+        df = db.get_customer_all_transactions("")
+        if len(df) == 0:
+            customers = db.get_all_customers()
+            if customers:
+                df = db.get_customer_all_transactions(customers[0])
+        
+        return df
+    except Exception as e:
+        st.error(f"Database error: {e}")
         return None
 
 @st.cache_resource
@@ -98,27 +108,31 @@ def get_autoencoder():
     else:
         return None
 
-def get_monthly_spending_from_csv(cust_data, account_no, amt_col):
-    current_month = datetime.now().month
-    current_year = datetime.now().year
-    
-    if 'CreateDate' in cust_data.columns and len(cust_data) > 0:
-        cust_data = cust_data.copy()
-        if cust_data['CreateDate'].dtype == 'object':
-            cust_data['CreateDate'] = pd.to_datetime(cust_data['CreateDate'], errors='coerce')
-        account_data = cust_data[cust_data['FromAccountNo'].astype(str) == str(account_no)]
-        monthly_data = account_data[
-            (account_data['CreateDate'].dt.month == current_month) & 
-            (account_data['CreateDate'].dt.year == current_year)
-        ]
-        return monthly_data[amt_col].sum() if len(monthly_data) > 0 else 0.0
-    return 0.0
+def get_monthly_spending_from_db(customer_id, account_no):
+    try:
+        db = get_db_service()
+        return db.get_monthly_spending(customer_id, account_no)
+    except Exception as e:
+        st.error(f"Error getting monthly spending: {e}")
+        return 0.0
 
-def login_page(df):
-    st.title("🏦 Banking Fraud Detection System")
+def login_page():
+    st.title("Banking Fraud Detection System")
     st.subheader("Login")
     
-    customers = sorted([str(c) for c in df['CustomerId'].dropna().unique()])
+    try:
+        db = get_db_service()
+        if not db.connect():
+            st.error("Cannot connect to database")
+            return
+        
+        customers = db.get_all_customers()
+        if not customers:
+            st.error("No customers found in database")
+            return
+    except Exception as e:
+        st.error(f"Database connection error: {e}")
+        return
     
     col1, col2, col3 = st.columns([1, 2, 1])
     with col2:
@@ -137,25 +151,36 @@ def login_page(df):
         st.info("Password: 12345")
 
 
-def dashboard(df, model, features, scaler=None, autoencoder=None):
+def dashboard(model, features, scaler=None, autoencoder=None):
     cid = str(st.session_state.customer_id)
-    amt_col = 'transaction_amount' if 'transaction_amount' in df.columns else 'AmountInAed'
-    cust_data = df[df['CustomerId'].astype(str) == cid]
-
-    st.title("Fraud Detection Dashboard")
     
-    st.subheader("Step 1: Select Account")
-    accounts = [str(a) for a in cust_data['FromAccountNo'].dropna().unique()] if 'FromAccountNo' in cust_data.columns and len(cust_data) > 0 else ["Default"]
-    
-    if len(accounts) == 0:
-        st.error("No accounts found for this customer")
-        return
+    try:
+        db = get_db_service()
+        if not db.connect():
+            st.error("Cannot connect to database")
+            return
         
+        accounts = db.get_customer_accounts(cid)
+        if not accounts:
+            st.error("No accounts found for this customer")
+            return
+        
+        account_data = db.get_account_transactions(cid, accounts[0]) if accounts else pd.DataFrame()
+    except Exception as e:
+        st.error(f"Database error: {e}")
+        return
+
+    st.subheader("Step 1: Select Account")
     account = st.selectbox("Select Account", accounts, label_visibility="collapsed")
     
-    account_data = cust_data[cust_data['FromAccountNo'].astype(str) == str(account)]
+    try:
+        account_data = db.get_account_transactions(cid, account)
+        csv_count = len(account_data)
+    except Exception as e:
+        st.error(f"Error loading account data: {e}")
+        csv_count = 0
+        account_data = pd.DataFrame()
     
-    csv_count = len(account_data)
     account_key = f"{cid}_{account}"
     session_count = st.session_state.session_count.get(account_key, 0)
     total_txns = csv_count + session_count
@@ -175,17 +200,17 @@ def dashboard(df, model, features, scaler=None, autoencoder=None):
     st.sidebar.markdown("---")
     
     if autoencoder is not None:
-        st.sidebar.success(" Autoencoder: Active")
+        st.sidebar.success("Autoencoder: Active")
     else:
-        st.sidebar.warning(" Autoencoder: Unavailable")
+        st.sidebar.warning("Autoencoder: Unavailable")
     
     st.sidebar.markdown("---")
     st.sidebar.subheader("Account Statistics")
     
     if len(account_data) > 0:
-        avg = account_data[amt_col].mean()
-        max_amt = account_data[amt_col].max()
-        std = account_data[amt_col].std() if len(account_data) > 1 else 0
+        avg = account_data['AmountInAed'].mean()
+        max_amt = account_data['AmountInAed'].max()
+        std = account_data['AmountInAed'].std() if len(account_data) > 1 else 0
         
         st.sidebar.markdown(f"**Average Transaction:** AED {avg:,.2f}")
         st.sidebar.markdown(f"**Max Transaction:** AED {max_amt:,.2f}")
@@ -197,9 +222,9 @@ def dashboard(df, model, features, scaler=None, autoencoder=None):
         st.sidebar.markdown(f"**Last 10 min:** {vel['txn_count_10min']} transactions")
         st.sidebar.markdown(f"**Last 1 hour:** {vel['txn_count_1hour']} transactions")
         
-        csv_monthly = get_monthly_spending_from_csv(cust_data, account, amt_col)
+        db_monthly = get_monthly_spending_from_db(cid, account)
         session_monthly = st.session_state.monthly_spending.get(account_key, 0.0)
-        total_monthly = csv_monthly + session_monthly
+        total_monthly = db_monthly + session_monthly
         
         st.sidebar.markdown("---")
         st.sidebar.subheader("Monthly Spending")
@@ -246,7 +271,7 @@ def dashboard(df, model, features, scaler=None, autoencoder=None):
     st.subheader("Step 3: Process Transaction")
  
     current_vel = get_velocity(cid, account)
-    st.caption(f" Debug: Current recorded txns - 10min: {current_vel['txn_count_10min']}, 1hour: {current_vel['txn_count_1hour']}")
+    st.caption(f"Debug: Current recorded txns - 10min: {current_vel['txn_count_10min']}, 1hour: {current_vel['txn_count_1hour']}")
     
     if st.button("Process Transaction", type="primary", use_container_width=True):
         current_vel = get_velocity(cid, account)
@@ -254,27 +279,22 @@ def dashboard(df, model, features, scaler=None, autoencoder=None):
         txn_count_10min = current_vel['txn_count_10min'] + 1
         txn_count_1hour = current_vel['txn_count_1hour'] + 1
         
-        csv_monthly = get_monthly_spending_from_csv(cust_data, account, amt_col)
+        db_monthly = get_monthly_spending_from_db(cid, account)
         session_monthly = st.session_state.monthly_spending.get(account_key, 0.0)
-        current_spending = csv_monthly + session_monthly
-        overall_avg = account_data[amt_col].mean() if len(account_data) > 0 else 5000
-        overall_std = account_data[amt_col].std() if len(account_data) > 1 else 2000
-        overall_max = account_data[amt_col].max() if len(account_data) > 0 else 15000
-
-        total_txns_count = len(account_data)
-        intl_ratio = 0.0
-        if total_txns_count > 0:
-            count_s = len(account_data[account_data['TransferType'] == 'S'])
-            intl_ratio = count_s / total_txns_count
-
-        user_stats = {
-            'user_avg_amount': overall_avg,
-            'user_std_amount': overall_std,
-            'user_max_amount': overall_max,
-            'user_txn_frequency': total_txns_count,
-            'user_international_ratio': intl_ratio,
-            'current_month_spending': current_spending
-        }
+        current_spending = db_monthly + session_monthly
+        
+        try:
+            user_stats = db.get_user_statistics(cid, account)
+        except Exception as e:
+            st.error(f"Error getting user statistics: {e}")
+            user_stats = {
+                'user_avg_amount': 5000.0,
+                'user_std_amount': 2000.0,
+                'user_max_amount': 15000.0,
+                'user_txn_frequency': 0,
+                'user_international_ratio': 0.0,
+                'current_month_spending': current_spending
+            }
 
         txn = {
             'amount': amount, 
@@ -303,14 +323,14 @@ def dashboard(df, model, features, scaler=None, autoencoder=None):
         t_type = r.get('t_type', 'O')
         result_account = r.get('account', account)
 
-        st.info(f" Velocity: {r.get('txn_count_10min', 0)} txns in 10min | {r.get('txn_count_1hour', 0)} txns in 1hour")
+        st.info(f"Velocity: {r.get('txn_count_10min', 0)} txns in 10min | {r.get('txn_count_1hour', 0)} txns in 1hour")
         
         if r.get('ae_reconstruction_error') is not None:
-            ae_status = " Anomaly" if r.get('ae_flag', False) else " Normal"
-            st.info(f" AE Error: {r['ae_reconstruction_error']:.4f} | Threshold: {r.get('ae_threshold', 'N/A'):.4f} | Status: {ae_status}")
+            ae_status = "Anomaly" if r.get('ae_flag', False) else "Normal"
+            st.info(f"AE Error: {r['ae_reconstruction_error']:.4f} | Threshold: {r.get('ae_threshold', 'N/A'):.4f} | Status: {ae_status}")
         
         if r['is_fraud']:
-            st.error(" FRAUD ALERT - Transaction Flagged!")
+            st.error("FRAUD ALERT - Transaction Flagged!")
 
             for reason in r['reasons']:
                 if isinstance(reason, str):
@@ -339,7 +359,7 @@ def dashboard(df, model, features, scaler=None, autoencoder=None):
                     st.rerun()
 
         else:
-            st.success(" SAFE TRANSACTION")
+            st.success("SAFE TRANSACTION")
             st.info(f"Amount: AED {r['amount']:,.2f} | Threshold: AED {r['threshold']:,.2f}")
 
             if st.button("Confirm & Continue", type="primary"):
@@ -352,19 +372,15 @@ def dashboard(df, model, features, scaler=None, autoencoder=None):
 def main():
     init_state()
     
-    df = load_data()
-    if df is None:
-        return
-    
     model, features, scaler = get_model()
     if model is None:
         return
     autoencoder = get_autoencoder()
     
     if st.session_state.logged_in:
-        dashboard(df, model, features, scaler=scaler, autoencoder=autoencoder)
+        dashboard(model, features, scaler=scaler, autoencoder=autoencoder)
     else:
-        login_page(df)
+        login_page()
 
 if __name__ == "__main__":
     main()

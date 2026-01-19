@@ -10,6 +10,7 @@ from backend.hybrid_decision import make_decision
 from backend.utils import get_feature_engineered_path, load_model
 from backend.autoencoder import AutoencoderInference
 from backend.rule_engine import calculate_all_limits
+from backend.db_service import get_db_service
 
 app = FastAPI(title="Banking Fraud Detection API", version="1.0.0")
 
@@ -32,23 +33,13 @@ class TransactionResponse(BaseModel):
     processing_time_ms: int
 
 
-class UserStatsManager:
+class DatabaseStatsManager:
     def __init__(self):
         self.stats_file = "data/user_stats.json"
         self.velocity_file = "data/velocity_counters.json"
         self.stats = self.load_stats()
         self.velocity = self.load_velocity()
-        self.historical_data = self.load_historical_data()
-    
-    def load_historical_data(self):
-        try:
-            path = get_feature_engineered_path()
-            if os.path.exists(path):
-                return pd.read_csv(path)
-            return pd.DataFrame()
-        except Exception as e:
-            print(f"Error loading historical data: {e}")
-            return pd.DataFrame()
+        self.db_service = get_db_service()
     
     def load_stats(self):
         if os.path.exists(self.stats_file):
@@ -70,113 +61,21 @@ class UserStatsManager:
             json.dump(self.velocity, f)
     
     def get_user_stats(self, customer_id: str, account_no: str):
-        key = f"{customer_id}_{account_no}"
-        
-        if key in self.stats:
-            # OPTIONAL: Ensure old cached stats get new keys if missing
-            if "user_weekly_total" not in self.stats[key]:
-                self.stats[key].update({
-                    "user_transaction_velocity": 0,
-                    "user_weekly_total": 0.0,
-                    "user_weekly_txn_count": 0,
-                    "user_weekly_avg_amount": 0.0,
-                    "user_weekly_deviation": 0.0
-                })
-            return self.stats[key]
-        
-        if not self.historical_data.empty:
-            amt_col = 'transaction_amount' if 'transaction_amount' in self.historical_data.columns else 'AmountInAed'
-            cust_data = self.historical_data[self.historical_data['CustomerId'].astype(str) == str(customer_id)]
+        try:
+            if not self.db_service.connect():
+                raise Exception("Cannot connect to database")
             
-            if 'FromAccountNo' in cust_data.columns:
-                account_data = cust_data[cust_data['FromAccountNo'].astype(str) == str(account_no)]
-            else:
-                account_data = cust_data
-            
-            if len(account_data) > 0:
-                overall_avg = account_data[amt_col].mean()
-                overall_std = account_data[amt_col].std() if len(account_data) > 1 else 2000.0
-                overall_max = account_data[amt_col].max()
-                total_txns_count = len(account_data)
-                
-                intl_ratio = 0.0
-                if 'TransferType' in account_data.columns and total_txns_count > 0:
-                    count_s = len(account_data[account_data['TransferType'] == 'S'])
-                    intl_ratio = count_s / total_txns_count
-                
-                current_month_spending = self.get_monthly_spending_from_csv(customer_id, account_no)
-                
-                self.stats[key] = {
-                    "user_avg_amount": float(overall_avg),
-                    "user_std_amount": float(overall_std),
-                    "user_max_amount": float(overall_max),
-                    "user_txn_frequency": int(total_txns_count),
-                    "user_international_ratio": float(intl_ratio),
-                    "current_month_spending": float(current_month_spending),
-                    # --- ADDED NEW KEYS (Defaulting to 0 for now) ---
-                    "user_transaction_velocity": 0,
-                    "user_weekly_total": 0.0,
-                    "user_weekly_txn_count": 0,
-                    "user_weekly_avg_amount": 0.0,
-                    "user_weekly_deviation": 0.0
-                }
-            else:
-                self.stats[key] = {
-                    "user_avg_amount": 5000.0,
-                    "user_std_amount": 2000.0,
-                    "user_max_amount": 15000.0,
-                    "user_txn_frequency": 0,
-                    "user_international_ratio": 0.0,
-                    "current_month_spending": 0.0,
-                    "user_transaction_velocity": 0,
-                    "user_weekly_total": 0.0,
-                    "user_weekly_txn_count": 0,
-                    "user_weekly_avg_amount": 0.0,
-                    "user_weekly_deviation": 0.0
-                }
-        else:
-            self.stats[key] = {
+            return self.db_service.get_user_statistics(customer_id, account_no)
+        except Exception as e:
+            print(f"Error getting user stats from DB: {e}")
+            return {
                 "user_avg_amount": 5000.0,
                 "user_std_amount": 2000.0,
                 "user_max_amount": 15000.0,
                 "user_txn_frequency": 0,
                 "user_international_ratio": 0.0,
-                "current_month_spending": 0.0,
-                "user_transaction_velocity": 0,
-                "user_weekly_total": 0.0,
-                "user_weekly_txn_count": 0,
-                "user_weekly_avg_amount": 0.0,
-                "user_weekly_deviation": 0.0
+                "current_month_spending": 0.0
             }
-        
-        return self.stats[key]
-    
-    def get_monthly_spending_from_csv(self, customer_id: str, account_no: str):
-        if self.historical_data.empty:
-            return 0.0
-            
-        current_month = datetime.now().month
-        current_year = datetime.now().year
-        
-        amt_col = 'transaction_amount' if 'transaction_amount' in self.historical_data.columns else 'AmountInAed'
-        cust_data = self.historical_data[self.historical_data['CustomerId'].astype(str) == str(customer_id)]
-        
-        if 'CreateDate' in cust_data.columns and len(cust_data) > 0:
-            cust_data = cust_data.copy()
-            if cust_data['CreateDate'].dtype == 'object':
-                cust_data['CreateDate'] = pd.to_datetime(cust_data['CreateDate'], errors='coerce')
-            
-            if 'FromAccountNo' in cust_data.columns:
-                account_data = cust_data[cust_data['FromAccountNo'].astype(str) == str(account_no)]
-            else:
-                account_data = cust_data
-                
-            monthly_data = account_data[
-                (account_data['CreateDate'].dt.month == current_month) & 
-                (account_data['CreateDate'].dt.year == current_year)
-            ]
-            return monthly_data[amt_col].sum() if len(monthly_data) > 0 else 0.0
-        return 0.0
     
     def get_velocity_metrics(self, customer_id: str, account_no: str):
         key = f"{customer_id}_{account_no}"
@@ -199,18 +98,14 @@ class UserStatsManager:
         }
     
     def check_is_new_beneficiary(self, customer_id: str, recipient_account: str):
-        if self.historical_data.empty:
-            return 1 
+        try:
+            if not self.db_service.connect():
+                return 1
             
-        cust_data = self.historical_data[self.historical_data['CustomerId'].astype(str) == str(customer_id)]
-        
-        if 'ReceipentAccount' not in cust_data.columns and 'RecipientAccount' not in cust_data.columns:
-            return 0 
-            
-        col_name = 'ReceipentAccount' if 'ReceipentAccount' in cust_data.columns else 'RecipientAccount'
-        
-        path_recipients = cust_data[col_name].astype(str).unique()
-        return 0 if str(recipient_account) in path_recipients else 1
+            return self.db_service.check_new_beneficiary(customer_id, recipient_account)
+        except Exception as e:
+            print(f"Error checking beneficiary: {e}")
+            return 1
 
     def record_transaction(self, customer_id: str, account_no: str, amount: float):
         key = f"{customer_id}_{account_no}"
@@ -220,16 +115,10 @@ class UserStatsManager:
             self.velocity[key] = []
         self.velocity[key].append(now.isoformat())
         
-        stats = self.get_user_stats(customer_id, account_no)
-        stats["user_txn_frequency"] += 1
-        
         session_key = f"{key}_session_spending"
         if session_key not in self.stats:
             self.stats[session_key] = 0.0
         self.stats[session_key] += amount
-        
-        csv_monthly = self.get_monthly_spending_from_csv(customer_id, account_no)
-        stats["current_month_spending"] = csv_monthly + self.stats[session_key]
         
         self.save_stats()
     
@@ -252,7 +141,7 @@ class UserStatsManager:
         else:
             df_new.to_csv(history_file, index=False)
 
-stats_manager = UserStatsManager()
+stats_manager = DatabaseStatsManager()
 model, features, scaler = load_model()
 autoencoder = AutoencoderInference()
 autoencoder.load()
@@ -260,9 +149,18 @@ autoencoder.load()
 
 @app.get("/api/health")
 def health_check():
+    db_status = "connected"
+    try:
+        db = get_db_service()
+        if not db.connect():
+            db_status = "disconnected"
+    except Exception as e:
+        db_status = f"error: {str(e)}"
+    
     return {
         "status": "healthy",
         "timestamp": datetime.now().isoformat(),
+        "database": db_status,
         "models": {
             "isolation_forest": "loaded" if model else "unavailable",
             "autoencoder": "loaded" if autoencoder else "unavailable"
@@ -313,3 +211,7 @@ def analyze_transaction(request: TransactionRequest):
         transaction_id=transaction_id,
         processing_time_ms=processing_time
     )
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8001)
