@@ -24,11 +24,19 @@ def check_rule_violation(
     transfer_type,
     txn_count_10min,
     txn_count_1hour,
-    monthly_spending
+    monthly_spending,
+    is_new_beneficiary=0  # New parameter
 ):
     reasons = []
     violated = False
     threshold = calculate_threshold(user_avg, user_std, transfer_type)
+
+    # NEW BENEFICIARY RULE - CRITICAL SECURITY CHECK
+    if is_new_beneficiary == 1:
+        violated = True
+        reasons.append(
+            f"New beneficiary detected: Transaction to unknown recipient requires approval"
+        )
 
     if txn_count_10min > MAX_VELOCITY_10MIN:
         violated = True

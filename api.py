@@ -180,6 +180,7 @@ def analyze_transaction(request: TransactionRequest):
         "amount": request.transaction_amount,
         "transfer_type": request.transfer_type,
         "bank_country": request.bank_country,
+        "datetime": request.datetime,  # Pass datetime for hour/night detection
         "txn_count_30s": 1,  
         "txn_count_10min": velocity["txn_count_10min"] + 1,
         "txn_count_1hour": velocity["txn_count_1hour"] + 1,
