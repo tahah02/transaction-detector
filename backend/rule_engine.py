@@ -25,13 +25,13 @@ def check_rule_violation(
     txn_count_10min,
     txn_count_1hour,
     monthly_spending,
-    is_new_beneficiary=0  # New parameter
+    session_spending=0,
+    is_new_beneficiary=0
 ):
     reasons = []
     violated = False
     threshold = calculate_threshold(user_avg, user_std, transfer_type)
 
-    # NEW BENEFICIARY RULE - CRITICAL SECURITY CHECK
     if is_new_beneficiary == 1:
         violated = True
         reasons.append(
@@ -52,11 +52,12 @@ def check_rule_violation(
             f"(max allowed {MAX_VELOCITY_1HOUR})"
         )
 
-    projected = monthly_spending + amount
-    if projected > threshold:
+    total_spending = monthly_spending + session_spending + amount
+    if total_spending > threshold:
         violated = True
         reasons.append(
-            f"Monthly spending AED {projected:,.2f} exceeds limit AED {threshold:,.2f}"
+            f"Monthly spending AED {total_spending:,.2f} exceeds limit AED {threshold:,.2f} "
+            f"(DB: {monthly_spending:,.2f} + Session: {session_spending:,.2f} + Current: {amount:,.2f})"
         )
 
     return violated, reasons, threshold

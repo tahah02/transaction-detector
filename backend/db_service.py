@@ -1,18 +1,22 @@
 import pyodbc
 import pandas as pd
 import logging
+import os
+from dotenv import load_dotenv
 from typing import Optional, List, Dict, Any
+
+load_dotenv()
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class DatabaseService:
     def __init__(self):
-        self.server = "10.112.32.4"
-        self.port = "1433"
-        self.database = "retailchannelLogs"
-        self.username = "dbuser"
-        self.password = "Codebase202212?!"
+        self.server = os.getenv("DB_SERVER")
+        self.port = os.getenv("DB_PORT")
+        self.database = os.getenv("DB_DATABASE")
+        self.username = os.getenv("DB_USERNAME")
+        self.password = os.getenv("DB_PASSWORD")
         self.connection = None
         
         self.REQUIRED_COLUMNS = [

@@ -1,5 +1,5 @@
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, validator
 from datetime import datetime
 from typing import List, Optional
 import pandas as pd
@@ -11,17 +11,45 @@ from backend.utils import get_feature_engineered_path, load_model
 from backend.autoencoder import AutoencoderInference
 from backend.rule_engine import calculate_all_limits
 from backend.db_service import get_db_service
+from backend.velocity_service import get_velocity_service
+from backend.file_operations import get_safe_file_ops
+from backend.input_validator import get_validator
 
 app = FastAPI(title="Banking Fraud Detection API", version="1.0.0")
 
 class TransactionRequest(BaseModel):
-    customer_id: str
-    from_account_no: str
-    to_account_no: str
-    transaction_amount: float = Field(gt=0)
-    transfer_type: str = Field(pattern="^[SILQO]$")
+    customer_id: str = Field(..., min_length=6, max_length=10)
+    from_account_no: str = Field(..., min_length=5, max_length=20)
+    to_account_no: str = Field(..., min_length=5, max_length=20)
+    transaction_amount: float = Field(..., gt=0, le=1000000)
+    transfer_type: str = Field(..., regex="^[OILQS]$")
     datetime: datetime
     bank_country: Optional[str] = "UAE"
+    
+    @validator('customer_id')
+    def validate_customer_id(cls, v):
+        if not v.isdigit():
+            raise ValueError('Customer ID must contain only digits')
+        return v
+    
+    @validator('transaction_amount')
+    def validate_amount(cls, v):
+        if v < 1:
+            raise ValueError('Minimum amount is AED 1')
+        return round(v, 2)
+    
+    @validator('transfer_type')
+    def validate_transfer_type(cls, v):
+        return v.upper()
+    
+    @validator('datetime')
+    def validate_datetime(cls, v):
+        now = datetime.now()
+        if v > now:
+            raise ValueError('Transaction datetime cannot be in the future')
+        if (now - v).days > 1:
+            raise ValueError('Transaction datetime cannot be more than 1 day old')
+        return v
 
 class TransactionResponse(BaseModel):
     decision: str
@@ -33,32 +61,22 @@ class TransactionResponse(BaseModel):
     processing_time_ms: int
 
 
+from backend.file_operations import get_safe_file_ops
+from backend.velocity_service import get_velocity_service
+
 class DatabaseStatsManager:
     def __init__(self):
         self.stats_file = "data/user_stats.json"
-        self.velocity_file = "data/velocity_counters.json"
-        self.stats = self.load_stats()
-        self.velocity = self.load_velocity()
         self.db_service = get_db_service()
+        self.velocity_service = get_velocity_service()
+        self.file_ops = get_safe_file_ops()
+        self.stats = self.load_stats()
     
     def load_stats(self):
-        if os.path.exists(self.stats_file):
-            with open(self.stats_file, 'r') as f:
-                return json.load(f)
-        return {}
-    
-    def load_velocity(self):
-        if os.path.exists(self.velocity_file):
-            with open(self.velocity_file, 'r') as f:
-                return json.load(f)
-        return {}
+        return self.file_ops.read_json_safe(self.stats_file)
     
     def save_stats(self):
-        os.makedirs(os.path.dirname(self.stats_file), exist_ok=True)
-        with open(self.stats_file, 'w') as f:
-            json.dump(self.stats, f)
-        with open(self.velocity_file, 'w') as f:
-            json.dump(self.velocity, f)
+        self.file_ops.write_json_atomic(self.stats_file, self.stats)
     
     def get_user_stats(self, customer_id: str, account_no: str):
         try:
@@ -78,24 +96,21 @@ class DatabaseStatsManager:
             }
     
     def get_velocity_metrics(self, customer_id: str, account_no: str):
-        key = f"{customer_id}_{account_no}"
-        now = datetime.now()
+        return self.velocity_service.get_velocity_metrics(customer_id, account_no)
+    
+    def record_transaction(self, customer_id: str, account_no: str, amount: float):
+        self.velocity_service.record_transaction(customer_id, account_no, amount)
         
-        if key not in self.velocity:
-            self.velocity[key] = []
+        if hasattr(self, '_cleanup_counter'):
+            self._cleanup_counter += 1
+        else:
+            self._cleanup_counter = 1
         
-        history = [datetime.fromisoformat(t) for t in self.velocity[key]]
-        history = [t for t in history if (now - t).total_seconds() < 3600]
+        if self._cleanup_counter % 100 == 0:
+            cleanup_stats = self.velocity_service.cleanup_old_data()
+            print(f"Cleanup performed: {cleanup_stats}")
         
-        count_10min = sum(1 for t in history if (now - t).total_seconds() < 600)
-        count_1hour = len(history)
-        time_since_last = (now - max(history)).total_seconds() if history else 3600
-        
-        return {
-            'txn_count_10min': count_10min,
-            'txn_count_1hour': count_1hour,
-            'time_since_last_txn': time_since_last
-        }
+        self.save_stats()
     
     def check_is_new_beneficiary(self, customer_id: str, recipient_account: str):
         try:
@@ -106,40 +121,19 @@ class DatabaseStatsManager:
         except Exception as e:
             print(f"Error checking beneficiary: {e}")
             return 1
-
-    def record_transaction(self, customer_id: str, account_no: str, amount: float):
-        key = f"{customer_id}_{account_no}"
-        now = datetime.now()
-        
-        if key not in self.velocity:
-            self.velocity[key] = []
-        self.velocity[key].append(now.isoformat())
-        
-        session_key = f"{key}_session_spending"
-        if session_key not in self.stats:
-            self.stats[session_key] = 0.0
-        self.stats[session_key] += amount
-        
-        self.save_stats()
     
     def save_transaction_history(self, request, decision: str, result: dict, transaction_id: str):
-        history_file = "data/transaction_history.csv"
+        row_data = [
+            transaction_id,
+            request.customer_id,
+            request.from_account_no,
+            request.transaction_amount,
+            decision,
+            "|".join(result.get('reasons', [])) if result.get('reasons') else "Normal transaction",
+            datetime.now().isoformat()
+        ]
         
-        txn_record = {
-            "transaction_id": transaction_id,
-            "customer_id": request.customer_id,
-            "account_no": request.from_account_no,
-            "amount": request.transaction_amount,
-            "status": decision,
-            "reasons": "|".join(result.get('reasons', [])) if result.get('reasons') else "Normal transaction"
-        }
-        
-        df_new = pd.DataFrame([txn_record])
-        
-        if os.path.exists(history_file):
-            df_new.to_csv(history_file, mode='a', header=False, index=False)
-        else:
-            df_new.to_csv(history_file, index=False)
+        self.file_ops.append_csv_safe("data/transaction_history.csv", row_data)
 
 stats_manager = DatabaseStatsManager()
 model, features, scaler = load_model()
@@ -157,6 +151,8 @@ def health_check():
     except Exception as e:
         db_status = f"error: {str(e)}"
     
+    memory_stats = stats_manager.velocity_service.get_memory_stats()
+    
     return {
         "status": "healthy",
         "timestamp": datetime.now().isoformat(),
@@ -164,27 +160,52 @@ def health_check():
         "models": {
             "isolation_forest": "loaded" if model else "unavailable",
             "autoencoder": "loaded" if autoencoder else "unavailable"
-        }
+        },
+        "memory": memory_stats
     }
 
 @app.post("/api/analyze-transaction", response_model=TransactionResponse)
 def analyze_transaction(request: TransactionRequest):
     start_time = datetime.now()
     
-    user_stats = stats_manager.get_user_stats(request.customer_id, request.from_account_no)
-    velocity = stats_manager.get_velocity_metrics(request.customer_id, request.from_account_no)
+    try:
+        validation_result = get_validator().validate_transaction_request({
+            'customer_id': request.customer_id,
+            'from_account_no': request.from_account_no,
+            'to_account_no': request.to_account_no,
+            'transaction_amount': request.transaction_amount,
+            'transfer_type': request.transfer_type,
+            'bank_country': request.bank_country,
+            'datetime': request.datetime
+        })
+        
+        if not validation_result['valid']:
+            raise HTTPException(status_code=400, detail={
+                "error": "Validation failed",
+                "details": validation_result['errors']
+            })
+        
+        cleaned_data = validation_result['cleaned_data']
+        
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Input validation error: {str(e)}")
     
-    is_new_ben = stats_manager.check_is_new_beneficiary(request.customer_id, request.to_account_no)
+    user_stats = stats_manager.get_user_stats(cleaned_data['customer_id'], cleaned_data['from_account_no'])
+    velocity = stats_manager.get_velocity_metrics(cleaned_data['customer_id'], cleaned_data['from_account_no'])
+    session_spending = stats_manager.velocity_service.get_session_spending(cleaned_data['customer_id'], cleaned_data['from_account_no'])
+    
+    is_new_ben = stats_manager.check_is_new_beneficiary(cleaned_data['customer_id'], cleaned_data['to_account_no'])
     
     txn = {
-        "amount": request.transaction_amount,
-        "transfer_type": request.transfer_type,
-        "bank_country": request.bank_country,
-        "datetime": request.datetime,  # Pass datetime for hour/night detection
+        "amount": cleaned_data['transaction_amount'],
+        "transfer_type": cleaned_data['transfer_type'],
+        "bank_country": cleaned_data['bank_country'],
+        "datetime": cleaned_data['datetime'],
         "txn_count_30s": 1,  
         "txn_count_10min": velocity["txn_count_10min"] + 1,
         "txn_count_1hour": velocity["txn_count_1hour"] + 1,
         "time_since_last_txn": velocity["time_since_last_txn"],
+        "session_spending": session_spending,
         "is_new_beneficiary": is_new_ben
     }
     
@@ -193,11 +214,11 @@ def analyze_transaction(request: TransactionRequest):
     decision = "REQUIRES_USER_APPROVAL" if result['is_fraud'] else "APPROVED"
     
     processing_time = int((datetime.now() - start_time).total_seconds() * 1000)
-    transaction_id = f"txn_{request.datetime.strftime('%Y%m%d_%H%M%S')}_{request.customer_id}"
+    transaction_id = f"txn_{cleaned_data['datetime'].strftime('%Y%m%d_%H%M%S')}_{cleaned_data['customer_id']}"
     stats_manager.save_transaction_history(request, decision, result, transaction_id)
     
     if decision == "APPROVED":
-        stats_manager.record_transaction(request.customer_id, request.from_account_no, request.transaction_amount)
+        stats_manager.record_transaction(cleaned_data['customer_id'], cleaned_data['from_account_no'], cleaned_data['transaction_amount'])
     
     return TransactionResponse(
         decision=decision,
@@ -205,13 +226,24 @@ def analyze_transaction(request: TransactionRequest):
         confidence_level=0.85,
         reasons=result.get('reasons', []),
         individual_scores={
-            "rule_engine": {"violated": result['is_fraud'], "threshold": result.get('threshold', 0)},
-            "isolation_forest": {"anomaly_score": result.get('risk_score', 0), "is_anomaly": result.get('ml_flag', False)},
-            "autoencoder": {"reconstruction_error": result.get('ae_reconstruction_error'), "is_anomaly": result.get('ae_flag', False)}
+            "rule_engine": {"violated": result['rule_violation'], "threshold": result.get('threshold', 0)},
+            "isolation_forest": {"anomaly_score": result.get('risk_score', 0), "is_anomaly": result.get('ml_anomaly', False)},
+            "autoencoder": {"reconstruction_error": result.get('ae_reconstruction_error'), "is_anomaly": result.get('ae_anomaly', False)}
         },
         transaction_id=transaction_id,
         processing_time_ms=processing_time
     )
+
+@app.get("/api/cleanup")
+def manual_cleanup():
+    cleanup_stats = stats_manager.velocity_service.cleanup_old_data()
+    memory_stats = stats_manager.velocity_service.get_memory_stats()
+    
+    return {
+        "cleanup_performed": cleanup_stats,
+        "current_memory": memory_stats,
+        "timestamp": datetime.now().isoformat()
+    }
 
 if __name__ == "__main__":
     import uvicorn

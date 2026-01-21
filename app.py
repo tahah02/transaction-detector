@@ -2,23 +2,20 @@ import streamlit as st
 import pandas as pd
 import os
 from datetime import datetime
-import csv
 
 from backend.utils import get_feature_engineered_path, get_model_path, load_model
 from backend.hybrid_decision import make_decision
 from backend.rule_engine import calculate_all_limits
 from backend.autoencoder import AutoencoderInference
 from backend.db_service import get_db_service
+from backend.file_operations import get_safe_file_ops
+
+from backend.file_operations import get_safe_file_ops
 
 def save_transaction_to_csv(cid, amount, t_type, status="Approved"):
-    file_name = 'transaction_history.csv'
-    file_exists = os.path.isfile(file_name)
-    
-    with open(file_name, mode='a', newline='') as file:
-        writer = csv.writer(file)
-        if not file_exists:
-            writer.writerow(['CustomerID', 'Amount', 'Type', 'Status', 'Timestamp'])
-        writer.writerow([cid, amount, t_type, status, datetime.now()])
+    file_ops = get_safe_file_ops()
+    row_data = [cid, amount, t_type, status, datetime.now().isoformat()]
+    file_ops.append_csv_safe('transaction_history.csv', row_data)
 
 st.set_page_config(page_title="Banking Fraud Detection", layout="wide", initial_sidebar_state="expanded")
 
@@ -36,41 +33,20 @@ def init_state():
     if 'monthly_spending' not in st.session_state:
         st.session_state.monthly_spending = {}  
 
-def get_velocity(cid, account_no):
-    account_key = f"{cid}_{account_no}"
-    now = datetime.now()
-    
-    history = st.session_state.txn_history.get(account_key, [])
-    
-    count_10min = sum(1 for t in history if (now - t).total_seconds() < 600)
-    count_1hour = sum(1 for t in history if (now - t).total_seconds() < 3600)
-    
-    if history:
-        time_since_last = (now - max(history)).total_seconds()
-    else:
-        time_since_last = 3600 
-    
-    return {
-        'txn_count_10min': count_10min,
-        'txn_count_1hour': count_1hour,
-        'time_since_last_txn': time_since_last
-    }
+from backend.velocity_service import get_velocity_service
 
-def record_transaction(cid, account_no):
-    account_key = f"{cid}_{account_no}"
-    if account_key not in st.session_state.txn_history:
-        st.session_state.txn_history[account_key] = []
-    st.session_state.txn_history[account_key].append(datetime.now())
-    
-    if account_key not in st.session_state.session_count:
-        st.session_state.session_count[account_key] = 0
-    st.session_state.session_count[account_key] += 1
+def get_velocity(cid, account_no):
+    velocity_service = get_velocity_service()
+    return velocity_service.get_velocity_metrics(cid, account_no)
+
+def record_transaction(cid, account_no, amount=0):
+    velocity_service = get_velocity_service()
+    velocity_service.record_transaction(cid, account_no, amount)
 
 def add_monthly_spending(cid, account_no, amount):
-    account_key = f"{cid}_{account_no}"
-    if account_key not in st.session_state.monthly_spending:
-        st.session_state.monthly_spending[account_key] = 0.0
-    st.session_state.monthly_spending[account_key] += amount
+    velocity_service = get_velocity_service()
+    current_spending = velocity_service.get_session_spending(cid, account_no)
+    velocity_service.record_transaction(cid, account_no, amount)
 
 @st.cache_data
 def load_data():
@@ -248,7 +224,7 @@ def dashboard(model, features, scaler=None, autoencoder=None):
     
     with c1:
         st.markdown("**Transaction Amount (AED)**")
-        amount = st.number_input("", min_value=0.0, max_value=1000000.0, value=1000.0, step=100.0, key="amt_input")
+        amount = st.number_input("", min_value=1.0, max_value=1000000.0, value=1000.0, step=100.0, key="amt_input")
     
     with c2:
         st.markdown("**Transfer Type**")
@@ -263,7 +239,7 @@ def dashboard(model, features, scaler=None, autoencoder=None):
     
     with c3:
         st.markdown("**Bank Country**")
-        countries = ['UAE', 'USA', 'UK', 'India', 'Pakistan', 'Philippines', 'Egypt', 'Other']
+        countries = ['UAE', 'USA', 'UK', 'India', 'Pakistan', 'Philippines', 'Egypt', 'Saudi Arabia', 'Other']
         country = st.selectbox("", countries, key="country_input")
     
     st.markdown("---")
@@ -274,6 +250,14 @@ def dashboard(model, features, scaler=None, autoencoder=None):
     st.caption(f"Debug: Current recorded txns - 10min: {current_vel['txn_count_10min']}, 1hour: {current_vel['txn_count_1hour']}")
     
     if st.button("Process Transaction", type="primary", use_container_width=True):
+        if amount <= 0:
+            st.error("Amount must be greater than 0")
+            return
+        
+        if amount > 1000000:
+            st.error("Maximum amount is AED 1,000,000")
+            return
+        
         current_vel = get_velocity(cid, account)
         
         txn_count_10min = current_vel['txn_count_10min'] + 1
@@ -296,6 +280,10 @@ def dashboard(model, features, scaler=None, autoencoder=None):
                 'current_month_spending': current_spending
             }
 
+        from backend.velocity_service import get_velocity_service
+        velocity_service = get_velocity_service()
+        session_spending = velocity_service.get_session_spending(cid, account)
+
         txn = {
             'amount': amount, 
             'transfer_type': t_type, 
@@ -303,7 +291,8 @@ def dashboard(model, features, scaler=None, autoencoder=None):
             'account': account,
             'txn_count_10min': txn_count_10min,
             'txn_count_1hour': txn_count_1hour,
-            'time_since_last_txn': current_vel['time_since_last_txn']
+            'time_since_last_txn': current_vel['time_since_last_txn'],
+            'session_spending': session_spending
         }
 
         st.session_state.result = make_decision(txn, user_stats, model, features, autoencoder=autoencoder)

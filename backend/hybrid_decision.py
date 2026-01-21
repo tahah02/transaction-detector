@@ -5,14 +5,23 @@ from backend.rule_engine import check_rule_violation
 def make_decision(txn, user_stats, model, features, autoencoder=None):
     result = {
         "is_fraud": False,
+        "decision": "AUTO_APPROVED",
+        "auto_decision": True,
         "reasons": [],
         "risk_score": 0.0,
         "threshold": 0.0,
+        "rule_violation": False,
+        "ml_anomaly": False,
+        "ae_anomaly": False,
         "ml_flag": False,
         "ae_flag": False,
         "ae_reconstruction_error": None,
         "ae_threshold": None,
     }
+    
+    rule_violation = False
+    ml_anomaly = False
+    ae_anomaly = False
     violated, rule_reasons, threshold = check_rule_violation(
         amount=txn["amount"],
         user_avg=user_stats["user_avg_amount"],
@@ -21,12 +30,13 @@ def make_decision(txn, user_stats, model, features, autoencoder=None):
         txn_count_10min=txn["txn_count_10min"],
         txn_count_1hour=txn["txn_count_1hour"],
         monthly_spending=user_stats["current_month_spending"],
-        is_new_beneficiary=txn.get("is_new_beneficiary", 0)  # Pass new beneficiary flag
+        session_spending=txn.get("session_spending", 0),
+        is_new_beneficiary=txn.get("is_new_beneficiary", 0)
     )
 
     result["threshold"] = threshold
     if violated:
-        result["is_fraud"] = True
+        rule_violation = True
         result["reasons"].extend(rule_reasons)
 
     if model is not None:
@@ -116,8 +126,8 @@ def make_decision(txn, user_stats, model, features, autoencoder=None):
         result["risk_score"] = score
 
         if pred == -1:
+            ml_anomaly = True
             result["ml_flag"] = True
-            result["is_fraud"] = True
             result["reasons"].append(
                 f"ML anomaly detected: abnormal behavior pattern (risk score {score:.4f})"
             )
@@ -182,8 +192,22 @@ def make_decision(txn, user_stats, model, features, autoencoder=None):
             result["ae_threshold"] = ae_result['threshold']
             
             if ae_result['is_anomaly']:
+                ae_anomaly = True
                 result["ae_flag"] = True
-                result["is_fraud"] = True
                 result["reasons"].append(ae_result['reason'])
+
+    any_fraud_detected = rule_violation or ml_anomaly or ae_anomaly
+    
+    result["is_fraud"] = any_fraud_detected
+    result["rule_violation"] = rule_violation
+    result["ml_anomaly"] = ml_anomaly
+    result["ae_anomaly"] = ae_anomaly
+    
+    if any_fraud_detected:
+        result["decision"] = "REQUIRES_USER_APPROVAL"
+        result["auto_decision"] = False
+    else:
+        result["decision"] = "AUTO_APPROVED"
+        result["auto_decision"] = True
 
     return result
